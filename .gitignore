@@ -7,8 +7,6 @@ checkpoint/
 
 # Outputs and Media
 demo/output/
-*.mp4
-*.avi
 *.png
 *.jpg
 *.npz
