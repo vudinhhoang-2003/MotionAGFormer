@@ -1,0 +1,22 @@
+# Weights
+checkpoint/
+*.pt
+*.pth
+*.pth.tr
+*.weights
+
+# Outputs and Media
+demo/output/
+*.mp4
+*.avi
+*.png
+*.jpg
+*.npz
+
+# Python
+__pycache__/
+*.pyc
+
+# IDEs
+.vscode/
+.idea/
