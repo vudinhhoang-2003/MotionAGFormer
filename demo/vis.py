@@ -62,8 +62,9 @@ def show3Dpose(vals, ax):
         x, y, z = [np.array( [vals[I[i], j], vals[J[i], j]] ) for j in range(3)]
         ax.plot(x, y, z, lw=2, color = lcolor if LR[i] else rcolor)
 
-    RADIUS = 0.72
-    RADIUS_Z = 0.7
+    # Mở rộng bán kính không gian 3D để hộp không bị cắt nát xương khi người nằm ngang (Lúc ngã sải tay/chân cực dài)
+    RADIUS = 1.5
+    RADIUS_Z = 1.5
 
     xroot, yroot, zroot = vals[0,0], vals[0,1], vals[0,2]
     ax.set_xlim3d([-RADIUS+xroot, RADIUS+xroot])
@@ -100,7 +101,7 @@ def get_pose2D(video_path, output_dir):
     np.savez_compressed(output_npz, reconstruction=keypoints)
 
 
-def img2video(video_path, output_dir):
+def img2video(video_path, output_dir, action_name=None, predicted_score=None):
     cap = cv2.VideoCapture(video_path)
     fps = int(cap.get(cv2.CAP_PROP_FPS)) + 5
 
@@ -114,6 +115,10 @@ def img2video(video_path, output_dir):
 
     for name in names:
         img = cv2.imread(name)
+        if action_name is not None:
+            text = f"Action: {action_name.upper()} ({predicted_score:.2f})"
+            color = (0, 0, 255) if action_name == "falling" else (0, 255, 0)
+            cv2.putText(img, text, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2, cv2.LINE_AA)
         videoWrite.write(img)
 
     videoWrite.release()
@@ -243,6 +248,7 @@ def get_pose3D(video_path, output_dir):
 
     
     print('\nGenerating 3D pose...')
+    skeleton_3d_seq = []
     for idx, clip in enumerate(clips):
         input_2D = normalize_screen_coordinates(clip, w=img_size[1], h=img_size[0]) 
         input_2D_aug = flip_data(input_2D)
@@ -264,6 +270,10 @@ def get_pose3D(video_path, output_dir):
         post_out_all = output_3D[0].cpu().detach().numpy()
         
         for j, post_out in enumerate(post_out_all):
+            # Lưu lại nguyên bản khung xương không xoay nghiêng (Raw 3D) để đưa vào con AI Phân tích hành động
+            raw_3d_pose = post_out.copy()
+            skeleton_3d_seq.append(raw_3d_pose)
+        
             rot =  [0.1407056450843811, -0.1500701755285263, -0.755240797996521, 0.6223280429840088]
             rot = np.array(rot, dtype='float32')
             post_out = camera_to_world(post_out, R=rot, t=0)
@@ -287,6 +297,25 @@ def get_pose3D(video_path, output_dir):
         
     print('Generating 3D pose successful!')
 
+    action_name, predicted_score = None, None
+    print('\nStarting Action Classification (In-Memory)...')
+    try:
+        from classify_stgcnpp import classify_raw_keypoints, NTU60_XSUB_CLASSES
+        skeleton_3d_tensor = np.array(skeleton_3d_seq)
+        config_path = 'pyskl/configs/stgcn++/stgcn++_ntu60_xsub_3dkp/j.py'
+        checkpoint_path = 'pretrained/j.pth'
+        
+        top_results, _ = classify_raw_keypoints(
+            keypoints=skeleton_3d_tensor, config_path=config_path, checkpoint_path=checkpoint_path,
+            device='cuda:0' if torch.cuda.is_available() else 'cpu', clip_len=100, num_clips=10, tta=True
+        )
+        predicted_class_id = top_results[0][0]
+        predicted_score = top_results[0][1]
+        action_name = NTU60_XSUB_CLASSES[predicted_class_id] if predicted_class_id < len(NTU60_XSUB_CLASSES) else "Unknown"
+        print(f"\n>>>> ACTION DETECTED: {action_name.upper()} (Score: {predicted_score:.4f}) <<<<\n")
+    except Exception as e:
+        print(f"Action classification failed: {e}")
+
     ## all
     image_2d_dir = sorted(glob.glob(os.path.join(output_dir_2D, '*.png')))
     image_3d_dir = sorted(glob.glob(os.path.join(output_dir_3D, '*.png')))
@@ -300,7 +329,8 @@ def get_pose3D(video_path, output_dir):
         edge = (image_2d.shape[1] - image_2d.shape[0]) // 2
         image_2d = image_2d[:, edge:image_2d.shape[1] - edge]
 
-        edge = 130
+        # Giảm crop (cắt lề) của đồ thị 3D để khi nhân vật nằm ngang (FALLING) không bị chém mất tay chân
+        edge = 10
         image_3d = image_3d[edge:image_3d.shape[0] - edge, edge:image_3d.shape[1] - edge]
 
         ## show
@@ -321,6 +351,8 @@ def get_pose3D(video_path, output_dir):
         plt.margins(0, 0)
         plt.savefig(output_dir_pose + str(('%04d'% i)) + '_pose.png', dpi=200, bbox_inches = 'tight')
         plt.close(fig)
+        
+    return action_name, predicted_score
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -335,8 +367,8 @@ if __name__ == "__main__":
     output_dir = './demo/output/' + video_name + '/'
 
     get_pose2D(video_path, output_dir)
-    get_pose3D(video_path, output_dir)
-    img2video(video_path, output_dir)
+    action_name, predicted_score = get_pose3D(video_path, output_dir)
+    img2video(video_path, output_dir, action_name, predicted_score)
     print('Generating demo successful!')
 
 
