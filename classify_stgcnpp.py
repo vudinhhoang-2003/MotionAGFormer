@@ -139,6 +139,8 @@ def classify_raw_keypoints(keypoints, config_path, checkpoint_path=None,
         print("[classify] Converting H36M 17 → NTURGB+D 25 joints...")
         keypoints = h36m_to_nturgbd(keypoints)
         print(f"[classify] After conversion: {keypoints.shape}")
+        # Toạ độ đã được xoay và chuẩn hoá Y-up từ vis.py
+        print(f"[classify] Hip Y at frame 0 = {keypoints[0, 0, 1]:.4f}")
     elif fmt != 'nturgb+d':
         raise ValueError(
             f"Unsupported skeleton format. "

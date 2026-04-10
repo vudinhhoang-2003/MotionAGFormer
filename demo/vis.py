@@ -50,36 +50,35 @@ def show2Dpose(kps, img):
 def show3Dpose(vals, ax):
     ax.view_init(elev=15., azim=70)
 
+    # Cố định khung quan sát trong Thế giới (Mét)
+    # Vì người cao ~1.7m và có thể di chuyển quanh tâm, ta để lề rộng một chút
+    ax.set_xlim3d([-1.5, 1.5])
+    ax.set_ylim3d([-1.5, 1.5])
+    ax.set_zlim3d([0, 2.0]) # Sàn là 0, đỉnh là 2 mét
+
+    # Vẽ mặt sàn Grid để mắt người có mốc tham chiếu
+    x_grid, y_grid = np.meshgrid(np.linspace(-1.5, 1.5, 5), np.linspace(-1.5, 1.5, 5))
+    ax.plot_wireframe(x_grid, y_grid, np.zeros_like(x_grid), color='lightgrey', alpha=0.3, lw=0.5)
+
+    ax.set_xlabel('X (m)', fontsize=8)
+    ax.set_ylabel('Y (m)', fontsize=8)
+    ax.set_zlabel('Z (m)', fontsize=8)
+
     lcolor=(0,0,1)
     rcolor=(1,0,0)
 
     I = np.array( [0, 0, 1, 4, 2, 5, 0, 7,  8,  8, 14, 15, 11, 12, 8,  9])
     J = np.array( [1, 4, 2, 5, 3, 6, 7, 8, 14, 11, 15, 16, 12, 13, 9, 10])
-
     LR = np.array([0, 1, 0, 1, 0, 1, 0, 0, 0,   1,  0,  0,  1,  1, 0, 0], dtype=bool)
 
-    for i in np.arange( len(I) ):
+    for i in range(len(I)):
         x, y, z = [np.array( [vals[I[i], j], vals[J[i], j]] ) for j in range(3)]
-        ax.plot(x, y, z, lw=2, color = lcolor if LR[i] else rcolor)
-
-    # Mở rộng bán kính không gian 3D để hộp không bị cắt nát xương khi người nằm ngang (Lúc ngã sải tay/chân cực dài)
-    RADIUS = 1.5
-    RADIUS_Z = 1.5
-
-    xroot, yroot, zroot = vals[0,0], vals[0,1], vals[0,2]
-    ax.set_xlim3d([-RADIUS+xroot, RADIUS+xroot])
-    ax.set_ylim3d([-RADIUS+yroot, RADIUS+yroot])
-    ax.set_zlim3d([-RADIUS_Z+zroot, RADIUS_Z+zroot])
-    ax.set_aspect('auto') # works fine in matplotlib==2.2.2
+        ax.plot(x, y, z, lw=3, color = lcolor if LR[i] else rcolor)
 
     white = (1.0, 1.0, 1.0, 0.0)
     ax.xaxis.set_pane_color(white) 
     ax.yaxis.set_pane_color(white)
     ax.zaxis.set_pane_color(white)
-
-    ax.tick_params('x', labelbottom = False)
-    ax.tick_params('y', labelleft = False)
-    ax.tick_params('z', labelleft = False)
 
 
 def get_pose2D(video_path, output_dir):
@@ -103,25 +102,32 @@ def get_pose2D(video_path, output_dir):
 
 def img2video(video_path, output_dir, action_name=None, predicted_score=None):
     cap = cv2.VideoCapture(video_path)
-    fps = int(cap.get(cv2.CAP_PROP_FPS)) + 5
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    if fps == 0: fps = 25 # Fallback
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
-    names = sorted(glob.glob(os.path.join(output_dir + 'pose/', '*.png')))
+    # Đọc ảnh từ thư mục 'all/' (Nơi chứa ảnh ghép Input + Reconstruction)
+    names = sorted(glob.glob(os.path.join(output_dir + 'all/', '*.png')))
+    if not names:
+        print(f"[Error] No images found in {output_dir + 'all/'} to generate video.")
+        return
+
     img = cv2.imread(names[0])
     size = (img.shape[1], img.shape[0])
 
-    videoWrite = cv2.VideoWriter(output_dir + video_name + '.mp4', fourcc, fps, size) 
+    # Tên video output
+    video_basename = os.path.basename(video_path).split('.')[0]
+    out_video_path = os.path.join(output_dir, f"{video_basename}_demo.mp4")
+    videoWrite = cv2.VideoWriter(out_video_path, fourcc, fps, size) 
 
+    print(f"Combining {len(names)} images into video: {out_video_path}")
     for name in names:
         img = cv2.imread(name)
-        if action_name is not None:
-            text = f"Action: {action_name.upper()} ({predicted_score:.2f})"
-            color = (0, 0, 255) if action_name == "falling" else (0, 255, 0)
-            cv2.putText(img, text, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2, cv2.LINE_AA)
         videoWrite.write(img)
 
     videoWrite.release()
+    print(f"Video generated successfully at: {out_video_path}")
 
 
 def showimage(ax, img):
@@ -249,11 +255,22 @@ def get_pose3D(video_path, output_dir):
     
     print('\nGenerating 3D pose...')
     skeleton_3d_seq = []
+    global_foot_anchor = None
+    initial_2d_hip_y = None  # Vị trí hông 2D mốc để tính độ rơi
+    
     for idx, clip in enumerate(clips):
-        input_2D = normalize_screen_coordinates(clip, w=img_size[1], h=img_size[0]) 
-        input_2D_aug = flip_data(input_2D)
+        input_2D_raw = normalize_screen_coordinates(clip, w=img_size[1], h=img_size[0]) 
         
-        input_2D = torch.from_numpy(input_2D.astype('float32'))
+        # Lấy độ rơi từ 2D: Hông (khớp 0), trục Y (index 1)
+        hip_2d_y = input_2D_raw[:, :, 0, 1] # (B, T)
+        if initial_2d_hip_y is None:
+            initial_2d_hip_y = hip_2d_y[0, 0]
+        
+        # Độ sụt pixel 2D (dương = rơi xuống)
+        descent_2d = hip_2d_y - initial_2d_hip_y
+
+        input_2D_aug = flip_data(input_2D_raw)
+        input_2D = torch.from_numpy(input_2D_raw.astype('float32'))
         input_2D_aug = torch.from_numpy(input_2D_aug.astype('float32'))
         if torch.cuda.is_available():
             input_2D = input_2D.cuda()
@@ -265,21 +282,49 @@ def get_pose3D(video_path, output_dir):
 
         if idx == len(clips) - 1:
             output_3D = output_3D[:, downsample]
+            descent_2d = descent_2d[:, downsample]
 
-        output_3D[:, :, 0, :] = 0
-        post_out_all = output_3D[0].cpu().detach().numpy()
+        # 1. Phóng đại (Rescaling): Biến Hip-height từ 0.23m (tí hon) thành ~0.9m (người thực)
+        # 0.9 / 0.2317 ≈ 3.88
+        output_3D = output_3D * 3.88
+
+        # 2. Root Recovery: Bơm độ rơi 2D vào 3D Camera-space (Y+ là xuống)
+        # Hệ số quy đổi 2D-screen sang 3D-meters ≈ 3.5
+        recovery_factor = 3.5
+        output_3D[:, :, :, 1] += torch.from_numpy(descent_2d).to(output_3D.device).unsqueeze(-1) * recovery_factor
+
+        # 3. Fixed Foot-Anchor: Neo vào mốc bàn chân của frame đầu tiên
+        foot_mid_per_frame = (output_3D[:, :, 3, :] + output_3D[:, :, 6, :]) / 2.0
+        if global_foot_anchor is None:
+            global_foot_anchor = foot_mid_per_frame[0, 0, :].clone()
+            print(f"  [Root-Recovery] Initial Hip height: {output_3D[0,0,0,1].item():.4f}")
+            print(f"  [Root-Recovery] Foot Anchor set at: {global_foot_anchor.cpu().numpy()}")
         
-        for j, post_out in enumerate(post_out_all):
-            # Lưu lại nguyên bản khung xương không xoay nghiêng (Raw 3D) để đưa vào con AI Phân tích hành động
-            raw_3d_pose = post_out.copy()
-            skeleton_3d_seq.append(raw_3d_pose)
+        output_3D = output_3D - global_foot_anchor[None, None, None, :]
+
+        # ====================================================================
+        # World-Space Rotation & AI Alignment
+        # ====================================================================
+        rot_val = [0.1407056450843811, -0.1500701755285263, -0.755240797996521, 0.6223280429840088]
+        rot_q = np.array(rot_val, dtype='float32')
+        output_3D_np = output_3D[0].cpu().detach().numpy()  # (T, V, 3)
+        # Xoay sang World-space (Z-up)
+        world_3d_all = camera_to_world(output_3D_np, R=rot_q, t=0)
+
+        for j, post_out_world in enumerate(world_3d_all):
+            # 1. Chuẩn bị cho AI: Swap trục (X, Z, Y) -> AI-Y là trục thẳng đứng (Up)
+            # NTU-RGB+D AI mong đợi Y-up. Trong World-space, Z là Up.
+            # Sau khi swap: ai_pose[:, 1] (Y) = world_3d[:, 2] (Z_up)
+            ai_pose = post_out_world[:, [0, 2, 1]].copy()
+            skeleton_3d_seq.append(ai_pose)
+            
+            # DEBUG: Theo dõi trục Rơi thực tế (AI-Y)
+            if j % 20 == 0:
+                print(f"  [DEBUG-AI] Frame {idx*243+j}: Hip AI-Y = {ai_pose[0, 1]:.4f}")
         
-            rot =  [0.1407056450843811, -0.1500701755285263, -0.755240797996521, 0.6223280429840088]
-            rot = np.array(rot, dtype='float32')
-            post_out = camera_to_world(post_out, R=rot, t=0)
-            post_out[:, 2] -= np.min(post_out[:, 2])
-            max_value = np.max(post_out)
-            post_out /= max_value
+            # 2. Chuẩn bị cho Visualization: Giữ hệ tọa độ Tuyệt đối (Mét)
+            # Quan trọng: KHÔNG dùng min(Z) hay max_value nữa để thấy được quỹ đạo rơi thực
+            post_out = post_out_world.copy()
 
             fig = plt.figure(figsize=(9.6, 5.4))
             gs = gridspec.GridSpec(1, 1)
@@ -313,6 +358,13 @@ def get_pose3D(video_path, output_dir):
         predicted_score = top_results[0][1]
         action_name = NTU60_XSUB_CLASSES[predicted_class_id] if predicted_class_id < len(NTU60_XSUB_CLASSES) else "Unknown"
         print(f"\n>>>> ACTION DETECTED: {action_name.upper()} (Score: {predicted_score:.4f}) <<<<\n")
+        
+        # In Top 5 để debug xem FALLING đang xếp hạng mấy
+        print("--- TOP 5 PREDICTIONS ---")
+        for rank, (cls_id, score) in enumerate(top_results[:5]):
+            cls_name = NTU60_XSUB_CLASSES[cls_id] if cls_id < len(NTU60_XSUB_CLASSES) else "Unknown"
+            print(f"  #{rank+1}: {cls_name} ({score:.4f})")
+        print("-------------------------")
     except Exception as e:
         print(f"Action classification failed: {e}")
 
@@ -322,35 +374,34 @@ def get_pose3D(video_path, output_dir):
 
     print('\nGenerating demo...')
     for i in tqdm(range(len(image_2d_dir))):
-        image_2d = plt.imread(image_2d_dir[i])
-        image_3d = plt.imread(image_3d_dir[i])
+        image_2d = cv2.imread(image_2d_dir[i])
+        image_3d = cv2.imread(image_3d_dir[i])
 
-        ## crop
-        edge = (image_2d.shape[1] - image_2d.shape[0]) // 2
-        image_2d = image_2d[:, edge:image_2d.shape[1] - edge]
+        ## logo
+        image_3d = image_3d[10:-10, 10:-10]
 
-        # Giảm crop (cắt lề) của đồ thị 3D để khi nhân vật nằm ngang (FALLING) không bị chém mất tay chân
-        edge = 10
-        image_3d = image_3d[edge:image_3d.shape[0] - edge, edge:image_3d.shape[1] - edge]
+        ## resize
+        image_2d = cv2.resize(image_2d, (960, 540))
+        image_3d = cv2.resize(image_3d, (960, 540))
 
-        ## show
-        font_size = 12
-        fig = plt.figure(figsize=(15.0, 5.4))
-        ax = plt.subplot(121)
-        showimage(ax, image_2d)
-        ax.set_title("Input", fontsize = font_size)
+        ## concat
+        image_all = np.concatenate([image_2d, image_3d], axis=1)
 
-        ax = plt.subplot(122)
-        showimage(ax, image_3d)
-        ax.set_title("Reconstruction", fontsize = font_size)
+        ## text
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        if action_name:
+            # Chuyển tên hành động thành màu xanh nếu là Falling
+            color = (0, 255, 0) if action_name.lower() == 'falling' else (0, 255, 255)
+            cv2.putText(image_all, f'Action: {action_name.upper()} ({predicted_score:.2f})', (20, 50), font, 1, color, 2, cv2.LINE_AA)
+        
+        cv2.putText(image_all, 'Input', (200, 50), font, 1, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(image_all, 'Reconstruction', (1200, 50), font, 1, (255, 255, 255), 1, cv2.LINE_AA)
 
-        ## save
-        output_dir_pose = output_dir +'pose/'
-        os.makedirs(output_dir_pose, exist_ok=True)
-        plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0, wspace=0)
-        plt.margins(0, 0)
-        plt.savefig(output_dir_pose + str(('%04d'% i)) + '_pose.png', dpi=200, bbox_inches = 'tight')
-        plt.close(fig)
+        output_dir_all = output_dir +'all/'
+        os.makedirs(output_dir_all, exist_ok=True)
+        cv2.imwrite(output_dir_all + str(('%04d'% i)) + '_all.png', image_all)
+
+    print('Generating demo successful!')
         
     return action_name, predicted_score
 
